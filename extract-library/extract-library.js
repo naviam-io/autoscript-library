@@ -63,7 +63,7 @@ function main() {
 
     // create a zip output stream to write the zip file to the response output stream
     var tempFile = File.createTempFile("tmpZip", ".zip"); // "" for suffix, null for default dir
-
+    var tmpPath = tempFile.getPath();
     var zos = new ZipOutputStream(new FileOutputStream(tempFile));
 
     // collect the files to be zipped
