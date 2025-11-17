@@ -1,16 +1,24 @@
+var URI = Java.type("java.net.URI");
+
 var ByteArrayOutputStream = Java.type("java.io.ByteArrayOutputStream");
 var File = Java.type("java.io.File");
 var FileInputStream = Java.type("java.io.FileInputStream");
 var FileOutputStream = Java.type("java.io.FileOutputStream");
+var FileWriter = Java.type("java.io.FileWriter");
 
 var InputStreamReader = Java.type("java.io.InputStreamReader");
 
 var StandardCharsets = Java.type("java.nio.charset.StandardCharsets");
 
+var PosixFilePermissions = Java.type("java.nio.file.attribute.PosixFilePermissions");
 var Files = Java.type("java.nio.file.Files");
+var FileSystems = Java.type("java.nio.file.FileSystems");
 var FileVisitResult = Java.type("java.nio.file.FileVisitResult");
 var Paths = Java.type("java.nio.file.Paths");
 var SimpleFileVisitor = Java.type("java.nio.file.SimpleFileVisitor");
+var StandardCopyOption = Java.type("java.nio.file.StandardCopyOption");
+
+var HashMap = Java.type("java.util.HashMap");
 
 var JarEntry = Java.type("java.util.jar.JarEntry");
 var JarFile = Java.type("java.util.jar.JarFile");
@@ -23,13 +31,20 @@ var MaximoOslcProviderServlet = Java.type("com.ibm.tivoli.maximo.oslc.provider.M
 
 var Mbo = Java.type("psdi.mbo.Mbo");
 
+var MXServer = Java.type("psdi.server.MXServer");
+
 var Version = Java.type("psdi.util.Version");
 
 var WebClientSession = Java.type("psdi.webclient.system.session.WebClientSession");
 
 ByteArrayType = Java.type("byte[]");
 
-var version = Version.majorVersion + "." + Version.minorVersion + "." + Version.modLevel + "." + Version.patch;
+var ORGANIZATION = "peluk";
+var REPOSITORY = "internal";
+
+var version = Version.getProductVersion();
+// var productName = MXServer.getMXServer().getLicenseKeys() != null && MXServer.getMXServer().getLicenseKeys().contains("MANAGE") ? "manage" : "eam";
+var productName = "maximo";
 
 /**
  * Finds the business objects jar, the web client jar, and the common web jar and then processes them into a zip file.
@@ -59,24 +74,20 @@ function main() {
     // set the content type for a zip file
     response.setContentType("application/zip");
     // set the content disposition to attachment with a filename
-    response.setHeader("content-disposition", 'attachment; filename="manage-' + version + '.zip"');
+    response.setHeader("content-disposition", 'attachment; filename="' + productName + "-" + version + '.zip"');
 
     // create a zip output stream to write the zip file to the response output stream
     var tempFile = File.createTempFile("tmpZip", ".zip"); // "" for suffix, null for default dir
     var tmpPath = tempFile.getPath();
-    var zos = new ZipOutputStream(new FileOutputStream(tempFile));
 
     // collect the files to be zipped
     var files = [];
     files.push({ "name": "webclient-" + version + ".jar", "path": findWebClientJar() });
-    files.push({ "name": "asset-management-" + version + ".jar", "path": findBusinessObjectsJar() });
+    files.push({ "name": "businessobjects-" + version + ".jar", "path": findBusinessObjectsJar() });
     files.push({ "name": "commonweb-" + version + ".jar", "path": findCommonWeb() });
 
     // zip the files to the output stream
-    zipFiles(zos, files);
-
-    // flush the output stream to ensure all data is written
-    zos.flush();
+    zipFiles(tempFile, files);
 
     // Clean up temporary files that might have been created during the process
     files.forEach(function (filePath) {
@@ -123,10 +134,14 @@ function main() {
 
 /**
  * Zips the files to the provided ZipOutputStream.
- * @param {ZipOutputStream} zos the zip output stream to write the files to
+ * @param {File} tempFile the temporary file to write the zip to
  * @param {Array} files an array of objects that contain the name and path of the files to be zipped
  */
-function zipFiles(zos, files) {
+function zipFiles(tempFile, files) {
+    var folders = [];
+
+    var zos = new ZipOutputStream(new FileOutputStream(tempFile));
+
     // iterate over the files and add them to the zip output stream
     for (var i = 0; i < files.length; i++) {
         filePath = files[i];
@@ -134,8 +149,15 @@ function zipFiles(zos, files) {
         // check if the file exists and is not a directory
         var file = new File(filePath.path);
         if (file.exists() && !file.isDirectory()) {
+            // create a new ZipEntry for a folder and add it to the zip output stream the name is the file name without the extension or a trailing dash
+            var folderName = filePath.name.substring(0, filePath.name.lastIndexOf("-"));
+
+            var zipEntry = new ZipEntry(folderName + "/");
+            zos.putNextEntry(zipEntry);
+            zos.closeEntry();
+
             // create a new ZipEntry for the file and add it to the zip output stream
-            var zipEntry = new ZipEntry(filePath.name);
+            zipEntry = new ZipEntry(folderName + "/" + filePath.name);
             // put the entry in the zip output stream
             zos.putNextEntry(zipEntry);
             // create a FileInputStream to read the file from the server
@@ -151,10 +173,74 @@ function zipFiles(zos, files) {
             fis.close();
             // close the ZipEntry
             zos.closeEntry();
+
+            zipEntry = new ZipEntry(folderName + "/" + "pom.xml");
+            zos.putNextEntry(zipEntry);
+
+            var pom = createPOM(folderName);
+            var pomBytes = pom.getBytes(StandardCharsets.UTF_8);
+            zos.write(pomBytes, 0, pomBytes.length);
+
+            zos.closeEntry();
+
+            folders.push(folderName);
         }
     }
+
+    // create a ZipEntry for the deploy.bat file and add it to the zip output stream
+    var zipEntry = new ZipEntry("deploy.bat");
+    zos.putNextEntry(zipEntry);
+
+    var windowsCmd = createMavenDeployCmdScript(folders);
+
+    fis = new FileInputStream(windowsCmd);
+    // create a buffer to read the file in chunks, note this needs to be a byte array to avoid issues with JavaScript's typing
+    var buffer = new ByteArrayType(1024);
+    var length;
+    // loop through the file and write it to the zip output stream
+    while ((length = fis.read(buffer)) > 0) {
+        zos.write(buffer, 0, length);
+    }
+    // close the FileInputStream
+    fis.close();
+
+    // close the ZipEntry
+    zos.closeEntry();
+
     // finish the zip output stream to ensure all data is written
     zos.finish();
+
+    // flush the output stream to ensure all data is written
+    zos.flush();
+
+    // create a ZipEntry for the deploy.sh file and add it to the zip output stream
+    var bashScript = createMavenDeployBashScript(folders);
+
+    var path = Paths.get(bashScript.getAbsolutePath());
+
+    if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+        Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwxr-xr-x"));
+    }
+
+    var zipUri = URI.create("jar:" + tempFile.toURI());
+    var env = new HashMap();
+    env.put("enablePosixFileAttributes", "true");
+
+    var zipfs = FileSystems.newFileSystem(zipUri, env);
+
+    try {
+        var newFileToAdd = Paths.get(bashScript.getAbsolutePath()); // Path to the new file on the local filesystem
+
+        var pathInZip = zipfs.getPath("deploy.sh", []); // Path inside the zip
+
+        // 3. Copy the new file in, preserving its attributes
+        Files.copy(newFileToAdd, pathInZip, StandardCopyOption.COPY_ATTRIBUTES);
+    } finally {
+        zipfs.close();
+    }
+
+    // delete the temporary bash script file
+    bashScript.delete();
 }
 
 /**
@@ -230,20 +316,7 @@ function findWebClientJar() {
             jarFile.close();
 
             // create a Jar file for the WEB-INF/classes directory
-            return createJar(
-                tempFile.getAbsolutePath() + File.separator + File.separator + "WEB-INF" + File.separator + "classes",
-                tempFile.getAbsolutePath() +
-                    File.separator +
-                    "webclient-" +
-                    Version.majorVersion +
-                    "." +
-                    Version.minorVersion +
-                    "." +
-                    Version.modLevel +
-                    "." +
-                    Version.patch +
-                    ".jar"
-            );
+            return createJar(tempFile.getAbsolutePath() + File.separator + File.separator + "WEB-INF" + File.separator + "classes", tempFile.getAbsolutePath() + File.separator + "webclient-" + Version.majorVersion + "." + Version.minorVersion + "." + Version.modLevel + "." + Version.patch + ".jar");
         }
     } else {
         // find the path to the WEB-INF/classes directory within the exploded maximouiweb.war file
@@ -344,6 +417,93 @@ function getEntryName(sourceDir, file) {
         name = name.substring(1);
     }
     return name;
+}
+
+/**
+ * Create a pom.xml file content for the given artifact name.
+ * @param {string} name the name of the artifact to be created in the pom.xml file.
+ * @returns {string} the generated pom.xml content.
+ */
+function createPOM(name, description) {
+    if (description == null) {
+        if (name == "businessobjects") {
+            description = "Business Objects Jar for IBM Maximo.";
+        } else if (name == "webclient") {
+            description = "Web Client Jar for IBM Maximo.";
+        } else if (name == "commonweb") {
+            description = "Common Web Jar for IBM Maximo.";
+        } else {
+            description = "";
+        }
+    }
+
+    var pom = '<?xml version="1.0" encoding="UTF-8"?>\n';
+    pom += '<project xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd" xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n';
+    pom += "\t<modelVersion>4.0.0</modelVersion>\n";
+    pom += "\t<groupId>com.ibm." + productName + "</groupId>\n";
+    pom += "\t<artifactId>" + name + "</artifactId>\n";
+    pom += "\t<version>" + version + "</version>\n";
+    pom += "\t<description>" + description + "</description>\n";
+    pom += "\t<distributionManagement>\n";
+    pom += "\t\t<repository>\n";
+    pom += "\t\t\t<id>" + REPOSITORY + "</id>\n";
+    pom += "\t\t\t<url>https://pkgs.dev.azure.com/" + ORGANIZATION + "/_packaging/" + REPOSITORY + "/maven/v1</url>\n";
+    pom += "\t\t\t<releases>\n";
+    pom += "\t\t\t\t<enabled>true</enabled>\n";
+    pom += "\t\t\t</releases>\n";
+    pom += "\t\t</repository>\n";
+    pom += "\t</distributionManagement>\n";
+    pom += "</project>\n";
+    return pom;
+}
+
+/**
+ * Creates a bash script to deploy the Maven artifacts for the given folders.
+ * @param {array} folders an array of folder names to create a bash script for deploying the Maven artifacts.
+ * @returns {java.io.File} a temporary file containing the bash script to deploy the Maven artifacts.
+ */
+function createMavenDeployBashScript(folders) {
+    var script = "#!/bin/bash\n\n";
+    var windowsCmdScript = "@echo off\n\n";
+
+    folders.forEach(function (folder) {
+        script += "(cd " + folder + "  && mvn deploy)\n\n";
+        windowsCmdScript += "(cd /d " + folder + "  && mvn deploy)\n\n";
+    });
+
+    var tmpFile = File.createTempFile("deployScript", ".sh");
+    var writer = new FileWriter(tmpFile);
+
+    try {
+        writer.write(script);
+    } finally {
+        writer.close();
+    }
+
+    return tmpFile;
+}
+
+/**
+ * Creates a CMD script to deploy the Maven artifacts for the given folders.
+ * @param {array} folders an array of folder names to create a CMD script for deploying the Maven artifacts.
+ * @returns {java.io.File} a temporary file containing the CMD script to deploy the Maven artifacts.
+ */
+function createMavenDeployCmdScript(folders) {
+    var script = "@echo off\n\n";
+
+    folders.forEach(function (folder) {
+        script += "(cd /d " + folder + "  && mvn deploy)\n\n";
+    });
+
+    var tmpFile = File.createTempFile("deployScript", ".bat");
+    var writer = new FileWriter(tmpFile);
+    try {
+        writer.write(script);
+    } finally {
+        writer.close();
+    }
+
+    return tmpFile;
 }
 
 var scriptConfig = {
