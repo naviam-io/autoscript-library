@@ -1,8 +1,8 @@
 # Introduction
-Customers have traditionally embedded bar codes (Code 39, Code 128, etc.) in BIRT reports. This required utilizing external services (sending data from your Maximo system to a third-party via webservice) or required deploying bar code fonts to the server. And depending on the barcode type, java libraries to encode the value properly. As QR codes have become more of an industry standard, we wanted to provide the ability to generate a QR code within a BIRT report without relying on any external services and without the complexity of deploying custom java libaries and/or fonts. 
+Customers have traditionally embedded bar codes (Code 39, Code 128, etc.) in BIRT reports. This required utilizing external services (sending data from your Maximo system to a third-party via webservice) or required deploying bar code fonts to the server. And depending on the barcode type, java libraries to encode the value properly. As QR codes have become more of an industry standard, we wanted to provide the ability to generate a QR code within a BIRT report without relying on any external services and without the complexity of deploying custom java libraries and/or fonts. 
 
 # Install
-The `NAVIAM.QRCODE` script should be deployed in your Maximo instance. This can be deployed via Naviam's Maximo Development Tools or mnaually created as a script without a launch point. 
+The `NAVIAM.QRCODE` script should be deployed in your Maximo instance. This can be deployed via Naviam's Maximo Development Tools or manually created as a script without a launch point. 
 
 # Adding a QR Code to a BIRT report
 
