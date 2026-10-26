@@ -1,0 +1,25 @@
+{
+    "compilerOptions": {
+        "ignoreDeprecations": "6.0",
+        "target": "es5",
+        "module": "ES2015",
+        "lib": ["ES5", "ES2015.Promise", "ES2015"],
+        "allowJs": true,
+        "checkJs": false,
+        "outDir": "./dist",
+        "rootDir": ".",
+        "removeComments": true,
+        "noEmit": false,
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "strict": false,
+        "noUncheckedSideEffectImports": false,
+        "noImplicitAny": false,
+        "skipLibCheck": true,
+        "moduleResolution": "bundler",
+        "resolveJsonModule": true,
+        "types": []
+    },
+    "include": ["src/**/*", "runtime-globals.ts", "*.d.ts"],
+    "exclude": ["node_modules", "dist", "manage.d.ts"]
+}

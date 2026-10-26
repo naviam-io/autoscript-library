@@ -1,0 +1,358 @@
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const webpack = require('webpack');
+const TerserPlugin = require('terser-webpack-plugin');
+const NodePolyfillPlugin = require('node-polyfill-webpack-plugin');
+const { discoverScriptEntries } = require('./webpack-entries');
+
+// Where a production build writes its bundles, relative to this file.
+const OUTPUT_DIR = './dist';
+
+// Where a development build writes instead, so that iterating on a script does not overwrite what
+// was last built for deployment. Set it to OUTPUT_DIR to use a single directory for both.
+const DEV_OUTPUT_DIR = './dist-dev';
+
+// A script's output path mirrors the folder it sits in, so scripts/install/rematch.ts becomes
+// install/<autoscript name>.js. When each script sits in a folder that merely repeats its own
+// name, or in a single src folder as this project does, set this to true to drop that folder:
+// src/index.ts then becomes <autoscript name>.js rather than src/<autoscript name>.js.
+const DROP_PARENT_DIR = true;
+
+const embeddedAnnotationLoaderSource = `
+const annotationTagPattern = /@maximoGlobal\\b/;
+const jsDocFunctionPattern = /\\/\\*\\*[\\s\\S]*?@maximoGlobal\\b[\\s\\S]*?\\*\\/\\s*(?:export\\s+)?function\\s+([A-Za-z_$][\\w$]*)\\s*\\(/g;
+const jsDocVarPattern = /\\/\\*\\*[\\s\\S]*?@maximoGlobal\\b[\\s\\S]*?\\*\\/\\s*(?:export\\s+)?var\\s+([A-Za-z_$][\\w$]*)\\s*(?:=|;)/g;
+const lineFunctionPattern = /\\/\\/\\s*@maximoGlobal\\b[^\\n]*\\n\\s*(?:export\\s+)?function\\s+([A-Za-z_$][\\w$]*)\\s*\\(/g;
+const lineVarPattern = /\\/\\/\\s*@maximoGlobal\\b[^\\n]*\\n\\s*(?:export\\s+)?var\\s+([A-Za-z_$][\\w$]*)\\s*(?:=|;)/g;
+
+function collectNames(source, pattern, names) {
+    pattern.lastIndex = 0;
+    let match = pattern.exec(source);
+    while (match) {
+        names.add(match[1]);
+        match = pattern.exec(source);
+    }
+}
+
+module.exports = function maximoGlobalAnnotationLoader(source) {
+    if (typeof source !== "string") {
+        return source;
+    }
+
+    if (!annotationTagPattern.test(source) || source.indexOf("/* maximo-annotated-globals */") !== -1) {
+        return source;
+    }
+
+    const names = new Set();
+    collectNames(source, jsDocFunctionPattern, names);
+    collectNames(source, jsDocVarPattern, names);
+    collectNames(source, lineFunctionPattern, names);
+    collectNames(source, lineVarPattern, names);
+
+    if (names.size === 0) {
+        return source;
+    }
+
+    const assignmentLines = ["/* maximo-annotated-globals */", 'var __maximoGlobalScope = Function("return this")();'];
+    names.forEach((name) => {
+        assignmentLines.push("__maximoGlobalScope." + name + " = " + name + ";");
+    });
+
+    return source + "\\n\\n" + assignmentLines.join("\\n") + "\\n";
+};
+`;
+
+function getEmbeddedAnnotationLoaderPath() {
+    const loaderPath = path.join(os.tmpdir(), 'maximo-global-annotation-loader.cjs');
+    if (!fs.existsSync(loaderPath) || fs.readFileSync(loaderPath, 'utf8') !== embeddedAnnotationLoaderSource) {
+        fs.writeFileSync(loaderPath, embeddedAnnotationLoaderSource, 'utf8');
+    }
+    return loaderPath;
+}
+
+const embeddedAnnotationLoaderPath = getEmbeddedAnnotationLoaderPath();
+
+// Custom plugin to replace 'self' with 'this' for Nashorn compatibility
+class ReplaceGlobalSelfPlugin {
+    apply(compiler) {
+        // 1. Tap into 'thisCompilation' instead of 'emit'
+        compiler.hooks.thisCompilation.tap('ReplaceGlobalSelfPlugin', (compilation) => {
+            // 2. Use 'processAssets' to modify assets at the correct stage
+            compilation.hooks.processAssets.tap(
+                {
+                    name: 'ReplaceGlobalSelfPlugin',
+                    // Stage: OPTIMIZE_INLINE is meant for simple text replacements in existing assets
+                    stage: webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE_INLINE
+                },
+                (assets) => {
+                    Object.keys(assets).forEach((filename) => {
+                        if (filename.endsWith('.js')) {
+                            // 3. Get the original source
+                            const asset = compilation.getAsset(filename);
+                            let source = asset.source.source();
+
+                            // Ensure source is a string before replacing
+                            if (typeof source !== 'string') {
+                                source = source.toString();
+                            }
+
+                            // Replace standalone 'self' references
+                            let newContent = source.replace(/\bself\b/g, 'this');
+
+                            // Keep source style in TypeScript while ensuring emitted JS runs in Nashorn:
+                            // if bundle contains "main(); function main(){...} var scriptConfig",
+                            // rewrite emitted order to "function main(){...} main(); var scriptConfig".
+                            newContent = newContent.replace(
+                                /main\(\);\s*function main\(\)\s*\{([\s\S]*?)\}\s*var scriptConfig/g,
+                                'function main() {$1}\nmain();\nvar scriptConfig'
+                            );
+
+                            // Removed late injection call
+                            // 4. Use 'updateAsset' and 'RawSource' (modern Webpack 5 approach)
+                            compilation.updateAsset(filename, new webpack.sources.RawSource(newContent));
+                        }
+                    });
+                }
+            );
+        });
+    }
+}
+
+// Copies the files the Maximo Development Tools extension expects beside a deployed bundle, such
+// as <name>.predeploy.json, renaming them from the name they carry next to the source to the name
+// the bundle is deployed under.
+class CopyScriptSidecarsPlugin {
+    constructor(entries) {
+        this.entries = entries;
+    }
+
+    apply(compiler) {
+        compiler.hooks.afterEmit.tap('CopyScriptSidecarsPlugin', () => {
+            const outputDir = compiler.options.output.path;
+
+            this.entries.forEach((entry) => {
+                entry.sidecars.forEach((sidecar) => {
+                    const destination = path.join(outputDir, sidecar.to);
+                    fs.mkdirSync(path.dirname(destination), { recursive: true });
+                    fs.copyFileSync(sidecar.from, destination);
+                });
+            });
+        });
+    }
+}
+
+module.exports = (env, argv) => {
+    const mode = argv.mode || 'production';
+    const isProduction = mode === 'production';
+
+    // Every TypeScript file declaring a scriptConfig block is compiled into its own bundle, named
+    // after its autoscript name. Keeping them in one compilation matters: returning one
+    // configuration per script makes webpack instantiate ts-loader, Babel and the polyfills once
+    // per script, and run all of those compilations concurrently.
+    const entries = discoverScriptEntries(__dirname, { dropParentDir: DROP_PARENT_DIR });
+
+    const webpackEntries = {};
+    entries.forEach((entry) => {
+        webpackEntries[entry.entryName] = {
+            import: entry.import,
+            filename: entry.filename,
+            library: {
+                name: entry.libraryName,
+                type: 'assign',
+                export: 'default'
+            }
+        };
+    });
+
+    return {
+        mode,
+        // Disable eval-based source maps. Webpack's default dev devtool wraps modules in eval()
+        // with "use strict", which causes Nashorn to reject function declarations inside eval.
+        devtool: false,
+        entry: webpackEntries,
+        target: ['web', 'es5'],
+        performance: {
+            hints: false
+        },
+        output: {
+            // Each mode writes to its own directory, so that iterating on a script in development
+            // does not overwrite what was last built for deployment.
+            path: path.resolve(__dirname, isProduction ? OUTPUT_DIR : DEV_OUTPUT_DIR),
+            // The per-entry filename above decides the name; this is only the fallback.
+            filename: '[name].js',
+            clean: true,
+            globalObject: 'this',
+            // Force Webpack to not use arrow functions or async functions in its glue code
+            // Also force Webpack to not use const or other modern syntax in its runtime code to maintain ES5 compatibility
+            environment: {
+                arrowFunction: false,
+                asyncFunction: false,
+                bigIntLiteral: false,
+                const: false,
+                destructuring: false,
+                dynamicImport: false,
+                forOf: false,
+                module: false
+            },
+            iife: false,
+            scriptType: false
+        },
+        optimization: {
+            // Set this to false to disable minification during the build and make debugging easier
+            minimize: isProduction,
+            // Removed late injection call
+            minimizer: [terserMinimizer]
+        },
+        module: {
+            rules: [
+                {
+                    test: /\.ts$/,
+                    use: [
+                        'ts-loader',
+                        {
+                            loader: embeddedAnnotationLoaderPath
+                        }
+                    ],
+                    exclude: /node_modules/
+                },
+                {
+                    test: /\.js$/,
+                    // This was commented out to allow all node_modules to be transpiled for better compatibility
+                    // this may increase build time but the tradeoff is worth it for compatibility and consistency.
+                    // exclude: /node_modules\/(?!([package_name_here])\/).*/,
+                    use: {
+                        loader: 'babel-loader',
+                        options: {
+                            presets: [
+                                [
+                                    '@babel/preset-env',
+                                    {
+                                        targets: {
+                                            ie: '11'
+                                        },
+                                        modules: false,
+                                        useBuiltIns: false,
+                                        debug: false
+                                    }
+                                ]
+                            ],
+                            plugins: []
+                        }
+                    }
+                }
+            ]
+        },
+        resolve: {
+            extensions: ['.ts', '.js'],
+            fallback: {
+                path: require.resolve('path-browserify'),
+                stream: require.resolve('stream-browserify'),
+                crypto: require.resolve('crypto-browserify'),
+                buffer: require.resolve('buffer/'),
+                fs: false,
+                net: false,
+                tls: false
+            }
+        },
+        plugins: [
+            new NodePolyfillPlugin(),
+            new ReplaceGlobalSelfPlugin(),
+            new CopyScriptSidecarsPlugin(entries),
+            new webpack.ProvidePlugin({
+                // Old: process: 'process/browser',
+                // New: Explicitly add the .js extension
+                process: 'process/browser.js'
+            }),
+            new webpack.ProvidePlugin({
+                process: 'process/browser',
+                Buffer: ['buffer', 'Buffer']
+            }),
+            new webpack.BannerPlugin({
+                banner: `
+var global = this;
+var window = this; 
+      `,
+                raw: true,
+                entryOnly: false
+            })
+        ]
+    };
+};
+
+const terserMinimizer = new TerserPlugin({
+    terserOptions: {
+        ecma: 5,
+        compress: {
+            ecma: 5,
+            // Emit function declarations before call sites when possible.
+            // This preserves source style (main(); function main(){}) while
+            // avoiding Nashorn runtime resolution quirks in wrapped modules.
+            hoist_funs: true,
+            // Prevent treating implicit globals as undefined
+            typeofs: false,
+            // Don't evaluate typeof expressions - keeps typeof service === 'undefined' as-is
+            // and prevents replacing service with undefined
+            reduce_vars: false,
+            // Don't track variable assignments to prevent optimization of implicit globals
+            toplevel: false,
+            // Keep unused declarations like scriptConfig in the emitted bundle
+            unused: false,
+            // The scriptConfig block is read back out of the bundle as JSON, and !0 and !1 are not
+            // valid JSON, so rewriting true and false would silently drop its launch point flags.
+            booleans_as_integers: false,
+            booleans: false,
+            // Avoid dropping declarations whose initializers look side-effect free
+            dead_code: false,
+            side_effects: false
+            // Don't optimize top-level scope where implicit globals are used
+        },
+        output: {
+            ecma: 5,
+            comments: false
+        },
+        mangle: {
+            // Tell the minifier NEVER to rename these variables as they are implicit Maximo variables and must be preserved.
+            reserved: [
+                'generateQRCode',
+                'action',
+                'app',
+                'domainid',
+                'errorgroup',
+                'errorkey',
+                'evalresult',
+                'interactive',
+                'launchPoint',
+                'listErrorGroup',
+                'listErrorKey',
+                'listOrder',
+                'listWhere',
+                'mbo',
+                'mboname',
+                'mboset',
+                'mbovalue',
+                'onadd',
+                'ondelete',
+                'onupdate',
+                'params',
+                'relationObject',
+                'relationWhere',
+                'requestBody',
+                'responseBody',
+                'scriptConfig',
+                'scriptHome',
+                'scriptName',
+                'service',
+                'srcKeys',
+                'targetKeys',
+                'thisvalue',
+                'user',
+                'userInfo',
+                'wfinstance'
+            ],
+            keep_fnames: true,
+            toplevel: false
+            // Don't mangle top-level variables
+        }
+    }
+});

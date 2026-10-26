@@ -1,0 +1,28 @@
+{
+    "json.schemas": [
+        {
+            "fileMatch": [
+                "*.predeploy.json",
+                "*-predeploy.json"
+            ],
+            "url": "./.vscode/predeploy-schema.json"
+        },
+        {
+            "fileMatch": [],
+            "url": "./.vscode/deploy-schema.json"
+        },
+        {
+            "fileMatch": [
+                "*.manifest.json",
+                "*-manifest.json"
+            ],
+            "url": "./.vscode/manifest-schema.json"
+        },
+        {
+            "fileMatch": [
+                ".devtools-config.json"
+            ],
+            "url": "./.vscode/devtools-config-schema.json"
+        }
+    ]
+}

@@ -1,0 +1,6 @@
+{
+    "manifest": [
+        { "kind": "automationScript", "path": "src/index.ts" },
+        { "kind": "automationScript", "path": "src/qrcode-generate.ts" }
+    ]
+}
